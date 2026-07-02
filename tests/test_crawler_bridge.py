@@ -3,10 +3,13 @@
 import builtins
 import importlib
 import json
+import os
 import shutil
+import stat
 import sys
-import tempfile
 import unittest
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +18,18 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import lib.crawler_bridge as crawler_bridge
+
+
+@contextmanager
+def _temp_path():
+    root = Path(__file__).parent.parent / ".codex-test-tmp"
+    root.mkdir(exist_ok=True)
+    path = root / uuid.uuid4().hex
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _reset_playwright_cache():
@@ -83,26 +98,44 @@ class TestGetCrawlerStatus(unittest.TestCase):
         _reset_playwright_cache()
 
     def test_get_crawler_status(self):
-        cookie_dir = Path(tempfile.mkdtemp())
-        try:
+        with _temp_path() as cookie_dir:
             (cookie_dir / "weibo_cookies.json").write_text("[]", encoding="utf-8")
             with patch.object(crawler_bridge, "COOKIE_DIR", cookie_dir):
-                with patch.object(
-                    crawler_bridge,
-                    "is_playwright_available",
-                    return_value=True,
-                ):
-                    status = crawler_bridge.get_crawler_status()
+                with patch.dict(os.environ, {crawler_bridge.COOKIE_PERSIST_ENV: "1"}):
+                    with patch.object(
+                        crawler_bridge,
+                        "is_playwright_available",
+                        return_value=True,
+                    ):
+                        status = crawler_bridge.get_crawler_status()
 
             self.assertIsInstance(status, dict)
             self.assertIn("playwright_available", status)
             self.assertIn("cached_logins", status)
             self.assertIn("cookie_dir", status)
+            self.assertIn("cookie_persistence_enabled", status)
             self.assertTrue(status["playwright_available"])
+            self.assertTrue(status["cookie_persistence_enabled"])
             self.assertEqual(status["cookie_dir"], str(cookie_dir))
             self.assertIn("weibo", status["cached_logins"])
-        finally:
-            shutil.rmtree(cookie_dir, ignore_errors=True)
+
+    def test_get_crawler_status_does_not_list_logins_when_disabled(self):
+        with _temp_path() as cookie_dir:
+            (cookie_dir / "weibo_cookies.json").write_text("[]", encoding="utf-8")
+            with patch.object(crawler_bridge, "COOKIE_DIR", cookie_dir):
+                with patch.dict(os.environ, {crawler_bridge.COOKIE_PERSIST_ENV: ""}):
+                    with patch.object(
+                        crawler_bridge,
+                        "is_playwright_available",
+                        return_value=True,
+                    ):
+                        status = crawler_bridge.get_crawler_status()
+
+            self.assertIsInstance(status, dict)
+            self.assertTrue(status["playwright_available"])
+            self.assertFalse(status["cookie_persistence_enabled"])
+            self.assertEqual(status["cookie_dir"], str(cookie_dir))
+            self.assertEqual(status["cached_logins"], [])
 
 
 class TestCleanHtml(unittest.TestCase):
@@ -115,29 +148,42 @@ class TestCleanHtml(unittest.TestCase):
 
 class TestLoadCookiesMissingFile(unittest.TestCase):
     def test_load_cookies_missing_file(self):
-        d = Path(tempfile.mkdtemp())
-        try:
+        with _temp_path() as d:
             with patch.object(crawler_bridge, "COOKIE_DIR", d):
-                self.assertIsNone(crawler_bridge.load_cookies("nonexistent_platform"))
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+                with patch.dict(os.environ, {crawler_bridge.COOKIE_PERSIST_ENV: "1"}):
+                    self.assertIsNone(crawler_bridge.load_cookies("nonexistent_platform"))
 
 
 class TestSaveAndLoadCookies(unittest.TestCase):
+    def test_save_and_load_cookies_disabled_by_default(self):
+        cookies = [{"name": "session", "value": "abc", "domain": ".example.com"}]
+        with _temp_path() as td:
+            d = Path(td) / "cookies"
+            with patch.object(crawler_bridge, "COOKIE_DIR", d):
+                with patch.dict(os.environ, {crawler_bridge.COOKIE_PERSIST_ENV: ""}):
+                    crawler_bridge.save_cookies("weibo", cookies)
+                    loaded = crawler_bridge.load_cookies("weibo")
+
+            self.assertIsNone(loaded)
+            self.assertFalse((d / "weibo_cookies.json").exists())
+            self.assertFalse(d.exists())
+
     def test_save_and_load_cookies(self):
         cookies = [{"name": "session", "value": "abc", "domain": ".example.com"}]
-        d = Path(tempfile.mkdtemp())
-        try:
+        with _temp_path() as td:
+            d = Path(td) / "cookies"
             with patch.object(crawler_bridge, "COOKIE_DIR", d):
-                crawler_bridge.save_cookies("weibo", cookies)
-                loaded = crawler_bridge.load_cookies("weibo")
+                with patch.dict(os.environ, {crawler_bridge.COOKIE_PERSIST_ENV: "1"}):
+                    crawler_bridge.save_cookies("weibo", cookies)
+                    loaded = crawler_bridge.load_cookies("weibo")
 
             self.assertEqual(loaded, cookies)
             path = d / "weibo_cookies.json"
             self.assertTrue(path.exists())
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), cookies)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 COOKIE_DIR = Path.home() / ".config" / "last30days-cn" / "browser_cookies"
+COOKIE_PERSIST_ENV = "LAST30DAYS_CN_PERSIST_COOKIES"
 _playwright_available: Optional[bool] = None
 
 _DESKTOP_UA = (
@@ -51,8 +52,28 @@ def is_playwright_available() -> bool:
     return _playwright_available
 
 
+def _persist_cookies_enabled() -> bool:
+    return os.environ.get(COOKIE_PERSIST_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _chmod_best_effort(path: Path, mode: int):
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, mode)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def _ensure_cookie_dir():
     COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+    _chmod_best_effort(COOKIE_DIR, 0o700)
 
 
 def _get_cookie_path(platform: str) -> Path:
@@ -61,11 +82,19 @@ def _get_cookie_path(platform: str) -> Path:
 
 
 def save_cookies(platform: str, cookies: list):
+    if not _persist_cookies_enabled():
+        return
     path = _get_cookie_path(platform)
-    path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = json.dumps(cookies, ensure_ascii=False, indent=2)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+    _chmod_best_effort(path, 0o600)
 
 
 def load_cookies(platform: str) -> Optional[list]:
+    if not _persist_cookies_enabled():
+        return None
     path = _get_cookie_path(platform)
     if path.exists():
         try:
@@ -84,7 +113,7 @@ def _clean_html(text: str) -> str:
 
 @contextmanager
 def _launch_browser_context(platform: str, mobile: bool = False, headless: bool = True):
-    """统一构造 Playwright 浏览器上下文，自动加载并回写 cookies。
+    """统一构造 Playwright 浏览器上下文，按需加载并回写 cookies。
 
     Yields:
         (browser, context, page) 三元组
@@ -97,14 +126,14 @@ def _launch_browser_context(platform: str, mobile: bool = False, headless: bool 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         try:
+            persist_cookies = _persist_cookies_enabled()
             context = browser.new_context(
                 user_agent=ua,
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
                 viewport=viewport,
             )
-            cookies = load_cookies(platform)
-            if cookies:
+            if persist_cookies and (cookies := load_cookies(platform)):
                 try:
                     context.add_cookies(cookies)
                 except Exception as e:
@@ -114,10 +143,11 @@ def _launch_browser_context(platform: str, mobile: bool = False, headless: bool 
             try:
                 yield browser, context, page
             finally:
-                try:
-                    save_cookies(platform, context.cookies())
-                except Exception:
-                    pass
+                if persist_cookies:
+                    try:
+                        save_cookies(platform, context.cookies())
+                    except Exception:
+                        pass
         finally:
             try:
                 browser.close()
@@ -654,9 +684,10 @@ def _parse_relative_date(date_str: str) -> Optional[str]:
 def get_crawler_status() -> Dict[str, Any]:
     """获取爬虫引擎的状态信息。"""
     pw_available = is_playwright_available()
+    cookie_persistence_enabled = _persist_cookies_enabled()
     cached_platforms = []
 
-    if COOKIE_DIR.exists():
+    if cookie_persistence_enabled and COOKIE_DIR.exists():
         for f in COOKIE_DIR.glob("*_cookies.json"):
             platform = f.stem.replace("_cookies", "")
             cached_platforms.append(platform)
@@ -665,4 +696,5 @@ def get_crawler_status() -> Dict[str, Any]:
         "playwright_available": pw_available,
         "cached_logins": cached_platforms,
         "cookie_dir": str(COOKIE_DIR),
+        "cookie_persistence_enabled": cookie_persistence_enabled,
     }
